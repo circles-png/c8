@@ -1,5 +1,6 @@
 #![warn(clippy::pedantic, clippy::nursery)]
 
+use std::f32::consts::PI;
 use std::fmt::Write;
 
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -15,6 +16,7 @@ use log::{debug, info};
 use nannou::color::rgba8;
 use nannou::event::{Key, Update};
 use nannou::{app, App, Draw, Frame};
+use nannou_audio::{Buffer, Host, Stream};
 use rand::{random, thread_rng, Rng};
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +47,12 @@ impl Timer {
     }
 }
 
+enum WaitingForKey {
+    NotWaiting,
+    WaitingForPress { store_in: u8 },
+    WaitingForUp { store_in: u8, key: u8 },
+}
+
 struct System {
     memory: [u8; 0x1000],
     registers: [u8; 16],
@@ -55,9 +63,11 @@ struct System {
     display: [[bool; 64]; 32],
     program_counter: usize,
     pressed_keys: Vec<u8>,
-    waiting_for_key: Option<u8>,
+    waiting_for_key: WaitingForKey,
     display_tx: Sender<[[bool; 64]; 32]>,
     keys_rx: Receiver<Vec<u8>>,
+    sound_tx: Sender<bool>,
+    sound: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,7 +203,12 @@ impl System {
     const FONT_START: usize = 0x50;
     const ROM_START: usize = 0x200;
     const MEMORY_SIZE: usize = 0x1000;
-    fn new(rom: &[u8], display_tx: Sender<[[bool; 64]; 32]>, keys_rx: Receiver<Vec<u8>>) -> Self {
+    fn new(
+        rom: &[u8],
+        display_tx: Sender<[[bool; 64]; 32]>,
+        keys_rx: Receiver<Vec<u8>>,
+        sound_tx: Sender<bool>,
+    ) -> Self {
         let mut rng = thread_rng();
         let mut system = Self {
             memory: [0; Self::MEMORY_SIZE].map(|_| rng.gen()),
@@ -205,9 +220,11 @@ impl System {
             display: [[false; 64]; 32].map(|row| row.map(|_| rng.gen())),
             program_counter: 0,
             pressed_keys: Vec::new(),
-            waiting_for_key: None,
+            waiting_for_key: WaitingForKey::NotWaiting,
             display_tx,
             keys_rx,
+            sound_tx,
+            sound: false,
         };
         info!("loading font...");
         let font = include_bytes!("font");
@@ -290,7 +307,7 @@ impl System {
                 self.registers[0xF] = u8::from(!borrow);
             }
             Operation::ShiftLeft(register) => {
-                let bit = !self.registers[register as usize] & 0b1000_0000 >> 7;
+                let bit = (self.registers[register as usize] & 0b1000_0000) >> 7;
                 self.registers[register as usize] <<= 1;
                 self.registers[0xF] = bit;
             }
@@ -347,7 +364,7 @@ impl System {
                 self.registers[register as usize] = self.delay_timer.value();
             }
             Operation::WaitForKey(register) => {
-                self.waiting_for_key = Some(self.registers[register as usize]);
+                self.waiting_for_key = WaitingForKey::WaitingForPress { store_in: register };
             }
             Operation::SetDelayToRegister(register) => {
                 self.delay_timer.set(self.registers[register as usize]);
@@ -386,13 +403,25 @@ impl System {
         if let Ok(keys) = self.keys_rx.try_recv() {
             self.pressed_keys = keys;
         }
-        if let Some(key) = self.waiting_for_key {
-            if let Some(pressed_key) = self.pressed_keys.first() {
-                self.registers[key as usize] = *pressed_key;
-                self.waiting_for_key = None;
-            } else {
-                return false;
+        match self.waiting_for_key {
+            WaitingForKey::WaitingForPress { store_in } => {
+                if let Some(pressed_key) = self.pressed_keys.first() {
+                    self.waiting_for_key = WaitingForKey::WaitingForUp {
+                        store_in,
+                        key: *pressed_key,
+                    };
+                } else {
+                    return false;
+                }
             }
+            WaitingForKey::WaitingForUp { store_in, key } => {
+                if self.pressed_keys.contains(&key) {
+                    return false;
+                }
+                self.registers[store_in as usize] = key;
+                self.waiting_for_key = WaitingForKey::NotWaiting;
+            }
+            WaitingForKey::NotWaiting => {}
         }
         let data = [
             self.memory[self.program_counter],
@@ -419,14 +448,13 @@ impl System {
             self.program_counter
         );
         let operation = Operation::decode(data).unwrap();
-        if let Operation::Jump(address) = operation {
-            if address == self.program_counter {
-                info!("infinite loop (halt) detected, exiting...");
-                return true;
-            }
-        }
         info!("executing {:?}...", operation);
         self.execute(operation);
+        let old = self.sound;
+        self.sound = self.sound_timer.value() > 0;
+        if self.sound != old {
+            self.sound_tx.send(self.sound).unwrap();
+        }
         info!(
             "registers are {}...",
             self.registers
@@ -466,55 +494,89 @@ struct Model {
     display_rx: Receiver<[[bool; 64]; 32]>,
     keys_tx: Sender<Vec<u8>>,
     display: [[bool; 64]; 32],
+    keys: Vec<u8>,
+    sound_rx: Receiver<bool>,
+    sound: bool,
+    stream: Stream<f32>,
 }
 
-fn model(_: &App) -> Model {
+fn model(app: &App) -> Model {
+    app.main_window().set_resizable(false);
     info!("initialising system...");
     let (display_tx, display_rx) = channel();
     let (keys_tx, keys_rx) = channel();
-    let mut system = System::new(include_bytes!("rom.ch8"), display_tx, keys_rx);
+    let (sound_tx, sound_rx) = channel();
+    let mut system = System::new(include_bytes!("rom.ch8"), display_tx, keys_rx, sound_tx);
+    let host = Host::new();
+    let stream = host.new_output_stream(0.).render(audio).build().unwrap();
+    stream.play().unwrap();
     spawn(move || system.run());
     Model {
         display_rx,
         keys_tx,
         display: [[false; 64]; 32],
+        keys: Vec::new(),
+        sound_rx,
+        sound: false,
+        stream,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn audio(phase: &mut f32, buffer: &mut Buffer) {
+    let sample_rate = buffer.sample_rate() as f32;
+    let volume = 0.5;
+    for frame in buffer.frames_mut() {
+        let sine_amp = (2. * PI * *phase).sin();
+        *phase += 1000. / sample_rate;
+        *phase %= sample_rate;
+        for channel in frame {
+            *channel = sine_amp * volume;
+        }
     }
 }
 
 fn update(app: &App, model: &mut Model, _: Update) {
-    app.main_window().set_resizable(false);
-    model
-        .keys_tx
-        .send(
-            app.keys
-                .down
-                .iter()
-                .filter_map(|key| {
-                    [
-                        Key::X,
-                        Key::Key1,
-                        Key::Key2,
-                        Key::Key3,
-                        Key::Q,
-                        Key::W,
-                        Key::E,
-                        Key::A,
-                        Key::S,
-                        Key::D,
-                        Key::Z,
-                        Key::C,
-                        Key::Key4,
-                        Key::R,
-                        Key::F,
-                        Key::V,
-                    ]
-                    .iter()
-                    .position(|k| k == key)
-                    .map(|index| u8::try_from(index).unwrap())
-                })
-                .collect(),
-        )
-        .unwrap();
+    if let Ok(sound) = model.sound_rx.try_recv() {
+        model.sound = sound;
+    }
+    if model.sound {
+        model.stream.play().unwrap();
+    } else {
+        model.stream.pause().unwrap();
+    }
+    let old = model.keys.clone();
+    model.keys = app
+        .keys
+        .down
+        .iter()
+        .filter_map(|key| {
+            [
+                Key::X,
+                Key::Key1,
+                Key::Key2,
+                Key::Key3,
+                Key::Q,
+                Key::W,
+                Key::E,
+                Key::A,
+                Key::S,
+                Key::D,
+                Key::Z,
+                Key::C,
+                Key::Key4,
+                Key::R,
+                Key::F,
+                Key::V,
+            ]
+            .iter()
+            .position(|k| k == key)
+            .map(|index| u8::try_from(index).unwrap())
+        })
+        .collect();
+    if model.keys != old {
+        model.keys_tx.send(model.keys.clone()).unwrap();
+    }
     if let Ok(display) = model.display_rx.try_recv() {
         model.display = display;
     }
@@ -531,11 +593,11 @@ fn view(app: &App, model: &Model, frame: Frame) {
                     .x_y(
                         (x as f32).mul_add(
                             PIXEL_SIZE as f32,
-                            -app.window_rect().w() / 2. - PIXEL_SIZE as f32 / 2.,
+                            -app.window_rect().w() / 2. + PIXEL_SIZE as f32 / 2.,
                         ),
                         (-(y as f32)).mul_add(
                             PIXEL_SIZE as f32,
-                            app.window_rect().h() / 2. + PIXEL_SIZE as f32 / 2.,
+                            app.window_rect().h() / 2. - PIXEL_SIZE as f32 / 2.,
                         ),
                     )
                     .w_h(PIXEL_SIZE as f32, PIXEL_SIZE as f32)
